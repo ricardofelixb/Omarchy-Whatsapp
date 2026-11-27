@@ -885,7 +885,7 @@ SUPPORTED_CHAT_WHERE = f"""({chat_kind_sql()} = 'dm' OR (
 # (or newer) is accepted; leaves unknown to the registry keep failing closed.
 # Bumped with manifest.json (scripts/test checks it). The app compares it with
 # the plugin it loaded: an update that replaced only the plugin says so.
-HELPER_VERSION = "0.20.0"  # x-release-please-version
+HELPER_VERSION = "0.20.1"  # x-release-please-version
 WACLI_MINIMUM_VERSION = "0.17.1"
 WACLI_PARITY_VERSION = "0.19.0"
 # Leaves that only exist from a given wacli release. The parity check accepts
@@ -3116,21 +3116,21 @@ class Backend:
                  "_SYSTEMD_INVOCATION_ID=" + invocation,
                  "--grep", r"(?m)^\s*(?:Connected\.|Disconnected\.)\s*$|"
                  r"Logged out of WhatsApp|Stopping sync \(logged out\)|not authenticated",
-                 "--case-sensitive=yes", "--no-pager", "-o", "cat", "-n", "12"], timeout=2,
-                stdout_limit=32768, stderr_limit=1024,
+                 "--case-sensitive=yes", "--no-pager", "-o", "cat", "--reverse", "-n", "12"],
+                timeout=2, stdout_limit=32768, stderr_limit=1024,
             )
             if result.returncode != 0:
                 return "unknown"
-            state = "unknown"
+            # Newest first: some systemd versions imply --reverse for --grep -n, so ask for it.
             for line in result.stdout.splitlines():
                 if "Logged out of WhatsApp" in line or "Stopping sync (logged out)" in line \
                         or "not authenticated" in line.lower():
-                    state = "relink-required"
-                elif line.strip() == "Connected.":
-                    state = "connected"
-                elif line.strip() == "Disconnected.":
-                    state = "unknown"
-            return state
+                    return "relink-required"
+                if line.strip() == "Connected.":
+                    return "connected"
+                if line.strip() == "Disconnected.":
+                    return "unknown"
+            return "unknown"
         except (OSError, subprocess.TimeoutExpired, ProcessOutputLimitExceeded):
             return "unknown"
 
@@ -3163,6 +3163,18 @@ class Backend:
             ).returncode == 0
         except OmaWhatsAppError:
             return False
+
+    def _root_store_holder(self) -> Account | None:
+        """The account whose sync holds the lock of the account config's directory.
+
+        wacli takes that lock, the root store's, for ``accounts add``, ``use``
+        and ``remove``, whichever account they name (``withAccountsConfigLock``
+        in cmd/wacli/accounts.go). It is the implicit root account, or a named
+        account registered with the root store.
+        """
+        root_store = self.account_config.parent.resolve(strict=False)
+        return next((candidate for candidate in self.accounts()
+                     if candidate.store_dir == root_store and candidate.unit), None)
 
     def _yield_active_sync(self, account: Account) -> bool:
         """Stop an active unit under its lifecycle lock, leaving crash intent."""
@@ -3219,8 +3231,11 @@ class Backend:
         stderr_limit: int = MAX_PROCESS_ERROR,
         account: Any = ACTIVE_ACCOUNT,
         private_args: bool = True,
+        lock_holder: Account | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        lifecycle_account = (
+        # lock_holder: the account whose sync holds the lock this command
+        # needs, when that is not the account it runs as.
+        lifecycle_account = lock_holder or (
             self.active if account is ACTIVE_ACCOUNT or account is None else account
         )
         if not isinstance(lifecycle_account, Account):
@@ -4818,11 +4833,22 @@ class Backend:
             if result.returncode != 0:
                 raise OmaWhatsAppError(clean_error(result.stderr or result.stdout,
                     "WhatsApp did not accept the logout; the account stays linked."))
-            removed = False
+        removed = False
+        try:
             if account.selector not in {"implicit", "store"}:
-                removal = self._run(["--json", "accounts", "remove", account.name], timeout=30, account=None)
+                # The entry lives in the root store's config, which wacli locks
+                # while that store's sync runs: pause that sync if it is in the
+                # way. Outside the lock above, which may be the same lock.
+                removal_args = ["--json", "accounts", "remove", account.name]
+                holder = self._root_store_holder()
+                removal = self._run(removal_args, timeout=30, account=None) \
+                    if holder is None else self._mutate(
+                        removal_args, timeout=30, require_online=False,
+                        account=None, lock_holder=holder,
+                    )
                 removed = removal.returncode == 0
-        self._refresh_account_registry()
+        finally:
+            self._refresh_account_registry()
         return {"ok": True, "kind": "unlink", "account": account.name,
                 "removed": removed, "archive_kept": True}
 
@@ -7827,6 +7853,10 @@ class Backend:
                         stdout_limit=output_limit,
                         stderr_limit=output_limit if include_events else MAX_PROCESS_ERROR,
                         account=None,
+                        # These lock the root store, like accounts add.
+                        lock_holder=self._root_store_holder() if path in {
+                            ("accounts", "use"), ("accounts", "remove")
+                        } else None,
                     )
                 except OmaWhatsAppTimeout as exc:
                     if policy not in {"whatsapp-write", "destructive"}:
@@ -7923,12 +7953,17 @@ class Backend:
             self._validate_transport_targets(args, path)
         if policy == "sync" and not self.online(scoped):
             raise OmaWhatsAppError("Offline mode is on. Go online before syncing WhatsApp.")
+        # The sync to pause is the one holding the lock this command needs.
+        holder = scoped if unit and path in {("auth",), ("sync",)} else None
+        if path == ("accounts", "add"):
+            # wacli locks its account config's directory, the root store,
+            # whichever account is named.
+            holder = self._root_store_holder()
 
-        with self._state_lock(self._lifecycle_lock_name(scoped)):
+        with self._state_lock(self._lifecycle_lock_name(holder or scoped)):
             if policy == "sync" and not self.online(scoped):
                 raise OmaWhatsAppError("Offline mode is on. Go online before syncing WhatsApp.")
-            active = bool(unit) and path in {("auth",), ("sync",)} \
-                and self._yield_active_sync(scoped)
+            active = holder is not None and self._yield_active_sync(holder)
             operation_error: BaseException | None = None
             returncode: int | None = None
             try:
@@ -7948,18 +7983,20 @@ class Backend:
                 operation_error = exc
             if path == ("auth",):
                 self._invalidate_doctor_cache(scoped)
-            if active and isinstance(operation_error, OmaWhatsAppAuthRejected):
+            if active and path == ("auth",) \
+                    and isinstance(operation_error, OmaWhatsAppAuthRejected):
                 # A known revoked link must not be restarted by crash recovery.
+                # A rejected new account leaves the root store's link intact.
                 self._clear_lifecycle_recovery(scoped.unit)
-            elif active:
+            elif active and holder is not None:
                 try:
-                    self._restore_yielded_sync(scoped, active)
+                    self._restore_yielded_sync(holder, active)
                 except OmaWhatsAppError as exc:
                     if returncode == 0:
                         raise OmaWhatsAppPartialError(
                             "The terminal command completed, but background sync could not restart.",
                             {"kind": "lifecycle", "committed": True,
-                             "account": scoped.name},
+                             "account": holder.name},
                         ) from exc
                     raise OmaWhatsAppError(
                         "Background sync could not be restored after the terminal command."

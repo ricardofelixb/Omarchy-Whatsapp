@@ -1131,6 +1131,132 @@ class AccountLifecycleTests(unittest.TestCase):
         self.assertEqual(observed_intent, ["wacli-sync@home.service"])
         self.assertEqual(self.backend._lifecycle_recovery_units(), [])
 
+    def _add_account_in_terminal(self, outcome: object) -> list[object]:
+        """Run `accounts add` through the real transport; return the call order."""
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        calls: list[object] = []
+
+        def systemctl(args, *rest, **kwargs):
+            calls.append(args)
+            return completed
+
+        def terminal(command, *rest, **kwargs):
+            calls.append("wacli")
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return subprocess.CompletedProcess(command, outcome)
+
+        with mock.patch.object(self.backend, "_unit_active", return_value=True), \
+                mock.patch.object(
+                    self.backend, "_systemctl_user", side_effect=systemctl
+                ), mock.patch.object(
+                    self.backend, "_run_auth_terminal", side_effect=terminal
+                ):
+            try:
+                self.backend.transport_interactive(
+                    ["accounts", "add", "probe"], authorization="interactive"
+                )
+            except backend_module.OmaWhatsAppAuthRejected:
+                pass
+        return calls
+
+    def test_adding_an_account_pauses_the_sync_holding_the_root_store(self) -> None:
+        # wacli locks the directory of its account config, the root store,
+        # whichever account the new one is added beside.
+        root_store = self.backend.account_config.parent
+        owners = (
+            backend_module.Account(
+                backend_module.LEGACY_ACCOUNT_NAME, root_store, selector="store"
+            ),
+            backend_module.Account("main", root_store, True),
+        )
+        outcomes = (0, 1, backend_module.OmaWhatsAppAuthRejected("new link rejected"))
+        for owner in owners:
+            for outcome in outcomes:
+                with self.subTest(owner=owner.name, outcome=outcome):
+                    self.backend._accounts = [owner, self.home]
+                    self.backend._active = None
+                    self.assertEqual(self._add_account_in_terminal(outcome), [
+                        ["stop", owner.unit], "wacli", ["start", owner.unit],
+                    ])
+                    self.assertEqual(self.backend._lifecycle_recovery_units(), [])
+
+    def test_adding_an_account_leaves_syncs_of_other_stores_running(self) -> None:
+        self.assertEqual(self._add_account_in_terminal(0), ["wacli"])
+
+    def _root_store_owner(self) -> object:
+        """A named account registered with the root store, its sync running."""
+        owner = backend_module.Account("main", self.backend.account_config.parent, True)
+        self.backend._accounts = [owner, self.work, self.home]
+        return owner
+
+    def test_unlinking_pauses_the_sync_holding_the_root_store(self) -> None:
+        # accounts remove locks the account config's directory, like add.
+        owner = self._root_store_owner()
+        done = subprocess.CompletedProcess([], 0, '{"success":true}', "")
+        locked = subprocess.CompletedProcess([], 1, "", "store is locked")
+        answers = {"logout": [done], "remove": [locked, locked, done]}
+        order: list[object] = []
+
+        def run(args, **kwargs):
+            kind = "logout" if args[-2:] == ["auth", "logout"] else "remove"
+            order.append(kind)
+            return answers[kind].pop(0)
+
+        def systemctl(args, *rest, **kwargs):
+            order.append(args)
+            return done
+
+        with mock.patch.object(self.backend, "_run", side_effect=run), \
+                mock.patch.object(self.backend, "_sync_active", return_value=True), \
+                mock.patch.object(backend_module.time, "sleep"), \
+                mock.patch.object(self.backend, "_systemctl_user", side_effect=systemctl), \
+                mock.patch.object(self.backend, "_refresh_account_registry"):
+            result = self.backend.unlink_account("home", "home")
+        self.assertTrue(result["removed"], "the entry is removed, not left behind")
+        self.assertEqual(order, [
+            ["disable", "--now", self.home.unit], "logout", "remove", "remove",
+            ["stop", owner.unit], "remove", ["start", owner.unit],
+        ])
+        self.assertEqual(self.backend._lifecycle_recovery_units(), [])
+
+    def test_unlinking_without_contention_pauses_nothing(self) -> None:
+        self._root_store_owner()
+        done = subprocess.CompletedProcess([], 0, '{"success":true}', "")
+        with mock.patch.object(self.backend, "_run", return_value=done), \
+                mock.patch.object(self.backend, "_systemctl_user", return_value=done) as systemctl, \
+                mock.patch.object(self.backend, "_refresh_account_registry"):
+            self.assertTrue(self.backend.unlink_account("home", "home")["removed"])
+        self.assertEqual([call.args[0] for call in systemctl.call_args_list],
+                         [["disable", "--now", self.home.unit]])
+
+    def test_unlinking_with_no_root_sync_never_pauses_another_account(self) -> None:
+        # Nothing managed holds the root store: no sync is stopped on a guess.
+        done = subprocess.CompletedProcess([], 0, '{"success":true}', "")
+        locked = subprocess.CompletedProcess([], 1, "", "store is locked")
+        with mock.patch.object(self.backend, "_run", side_effect=[done, locked]), \
+                mock.patch.object(self.backend, "_systemctl_user", return_value=done) as systemctl, \
+                mock.patch.object(self.backend, "_refresh_account_registry") as refresh:
+            self.assertFalse(self.backend.unlink_account("home", "home")["removed"])
+        self.assertEqual([call.args[0] for call in systemctl.call_args_list],
+                         [["disable", "--now", self.home.unit]])
+        refresh.assert_called_once()
+
+    def test_gateway_account_config_writes_pause_the_root_store_sync(self) -> None:
+        owner = self._root_store_owner()
+        self.backend._active = self.home
+        done = subprocess.CompletedProcess([], 0, '{"success":true,"data":{}}', "")
+        for args in (["accounts", "use", "work"], ["accounts", "remove", "work"]):
+            authorization = "local-write" if args[1] == "use" else "destructive"
+            with self.subTest(args=args), mock.patch.object(
+                    self.backend, "_mutate", return_value=done) as mutate:
+                self.backend.transport({"args": args, "authorization": authorization})
+                self.assertIs(mutate.call_args.kwargs["lock_holder"], owner)
+        with mock.patch.object(self.backend, "_mutate", return_value=done) as mutate:
+            self.backend.transport({"args": ["contacts", "refresh"], "authorization": "local-write"})
+        self.assertIsNone(mutate.call_args.kwargs["lock_holder"],
+                          "other writes keep their own account's recovery")
+
     def test_lock_contention_recovery_is_serialized_per_account(self) -> None:
         self._online(self.home, True)
         self.backend.use_account("home")
